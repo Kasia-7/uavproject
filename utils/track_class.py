@@ -1,6 +1,5 @@
 import math
 import numpy as np
-
 # 点迹类
 class TrackPoint:
     def __init__(self, time, slant_range, azimuth_angle, elevation_angle, radial_velocity, cycle):
@@ -65,10 +64,52 @@ class TrackPoint:
         # 使用三维空间中两点之间的距离公式计算距离
         distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
         return distance
+    
+    #  根据方位角、俯仰角和径向速度计算xyz方向上的速度分量
+    def calculate_velocity_components(self):
+        """
+        根据方位角、俯仰角和径向速度计算xyz方向上的速度分量。
 
+        :param azimuth_angle: 方位角，从北方向顺时针测量的角度（度）
+        :param elevation_angle: 俯仰角，物体相对于地平线的角度（度）
+        :param radial_velocity: 径向速度，沿观察者到物体连线的速度分量
+        :return: xyz方向上的速度分量
+        """
+        # 将角度从度转换为弧度
+        azimuth_angle_rad = math.radians(self.azimuth_angle)
+        elevation_angle_rad = math.radians(self.elevation_angle)
+
+        # 计算vx, vy, vz速度分量
+        vx = self.radial_velocity * math.cos(elevation_angle_rad) * math.cos(azimuth_angle_rad)
+        vy = self.radial_velocity * math.cos(elevation_angle_rad) * math.sin(azimuth_angle_rad)
+        vz = self.radial_velocity * math.sin(elevation_angle_rad)
+
+        return vx, vy, vz
+    
+    # 将极坐标转换为直角坐标系中的xyz坐标
+    def polar_to_cartesian(self):
+        """
+        将极坐标转换为直角坐标系中的xyz坐标。
+
+        :param slant_range: 斜距，物体到观察点的直线距离
+        :param azimuth_angle: 方位角，从北方向顺时针测量的角度（度）
+        :param elevation_angle: 俯仰角，物体相对于地平线的角度（度）
+        :return: 直角坐标系中的xyz坐标
+            """
+        # 将角度从度转换为弧度
+        azimuth_angle_rad = math.radians(self.azimuth_angle)
+        elevation_angle_rad = math.radians(self.elevation_angle)
+
+        # 计算x, y, z坐标
+        x = self.slant_range * math.cos(elevation_angle_rad) * math.cos(azimuth_angle_rad)
+        y = self.slant_range * math.cos(elevation_angle_rad) * math.sin(azimuth_angle_rad)
+        z = self.slant_range * math.sin(elevation_angle_rad)
+
+        return x, y, z
+    
 # 航迹类
 class Track:
-    def __init__(self, max_unupdates=5):
+    def __init__(self, point, max_unupdates=4, dt=3):
         """
         初始化航迹类，包含点迹列表、预测点迹和未更新次数。
         
@@ -78,13 +119,24 @@ class Track:
         self.predicted_track_point = None  # 预测的下一个点迹
         self.unupdates = 0  # 未更新次数
         self.max_unupdates = max_unupdates  # 允许的最大未更新次数
+        self.dt = dt
         # 卡尔曼滤波器初始化
-        self.state_estimate = np.zeros(4)  # 状态估计[x, y, vx, vy]
-        self.covariance_estimate = np.eye(4)  # 状态估计协方差矩阵
-        self.process_noise_covariance = np.diag([1, 1, 0.1, 0.1])  # 过程噪声协方差矩阵
-        self.measurement_noise_covariance = np.diag([1, 1, 0.1, 0.1])  # 测量噪声协方差矩阵
-        self.measurement_matrix = np.eye(4)  # 测量矩阵
-        self.state_transition_matrix = np.eye(4)  # 状态转移矩阵
+        x,y,z = point.polar_to_cartesian()
+        vx,vy,vz = point.calculate_velocity_components()
+        self.state_estimate = [x,y,z,vx,vy,vz]  # 状态估计[x, y, z, vx, vy, vz]
+        self.covariance_estimate = np.eye(6)  # 状态估计协方差矩阵
+        self.process_noise_covariance = np.diag([1, 1, 1, 0.1, 0.1, 0.1])  # 过程噪声协方差矩阵
+        self.measurement_noise_covariance = np.diag([1, 1, 1, 0.1, 0.1, 0.1])  # 测量噪声协方差矩阵
+        self.measurement_matrix = np.eye(6)  # 测量矩阵
+        self.state_transition_matrix = np.eye(6)  # 状态转移矩阵
+        self.state_transition_matrix[:3, 3:] = dt * np.eye(3)
+        # 生成预测点
+        self.track_points.append(point)
+        self.predict_next_point()
+        # 更新卡尔曼滤波器
+        self.update_kalman_filter(point)
+        # self.track_points.append(point)
+        # self.predict_next_point()
 
     # 向航迹中添加一个新的点迹
     def add_track_point(self, track_point):
@@ -94,8 +146,12 @@ class Track:
         :param track_point: 新的点迹对象
         """
         self.track_points.append(track_point)
-        # 当添加新点迹时，重置未更新次数
-        self.unupdates = 0
+        # 获得预测点
+        self.predict_next_point()
+        # 更新卡尔曼滤波器
+        self.update_kalman_filter(track_point)
+        # print('当前点数据：',track_point)
+        # print('预测点数据：',self.predicted_track_point)
         
     # 更新未更新次数
     def update_unupdates(self):
@@ -113,6 +169,15 @@ class Track:
         """
         return self.unupdates < self.max_unupdates
     
+    # 判断航迹是否为稳定航迹
+    def is_stable(self):
+        """
+        判断航迹是否为稳定航迹。
+
+        :return: 如果航迹点数超过20，则为稳定航迹，返回True，否则返回False
+        """
+        return len(self.track_points) > 20
+    
     # 通过卡尔曼滤波器预测航迹的下一个点迹
     def predict_next_point(self):
             """
@@ -120,16 +185,17 @@ class Track:
             """
             # 卡尔曼滤波器预测步骤
             self.state_estimate = np.dot(self.state_transition_matrix, self.state_estimate)
+            state_estimate = get_full_polar_coordinates(self.state_estimate)
             self.covariance_estimate = np.dot(np.dot(self.state_transition_matrix, self.covariance_estimate), self.state_transition_matrix.T) + self.process_noise_covariance
             if len(self.track_points) > 0:
                 last_point = self.track_points[-1]
                 self.predicted_track_point = TrackPoint(
-                    time=last_point.time + 1,
-                    slant_range=self.state_estimate[0],
-                    azimuth_angle=self.state_estimate[1],
-                    elevation_angle=self.state_estimate[2],
-                    radial_velocity=self.state_estimate[3],
-                    cycle=last_point.cycle
+                    time=last_point.time + 3,
+                    slant_range=state_estimate[0],
+                    azimuth_angle=state_estimate[1],
+                    elevation_angle=state_estimate[2],
+                    radial_velocity=last_point.radial_velocity,
+                    cycle=last_point.cycle + 1
                 )
             else:
                 self.predicted_track_point = None
@@ -140,14 +206,16 @@ class Track:
         更新卡尔曼滤波器。
         """
         # 将track_point转换为适合卡尔曼滤波的测量向量
-        measurement = np.array([track_point.slant_range, track_point.azimuth_angle, track_point.radial_velocity])
-        
+        x,y,z = track_point.polar_to_cartesian()
+        vx,vy,vz = track_point.calculate_velocity_components()
+        measurement = [x,y,z,vx,vy,vz]
         # 卡尔曼滤波器更新步骤
         innovation = measurement - np.dot(self.measurement_matrix, self.state_estimate)
         innovation_cov = np.dot(np.dot(self.measurement_matrix, self.covariance_estimate), self.measurement_matrix.T) + self.measurement_noise_covariance
         kalman_gain = np.dot(np.dot(self.covariance_estimate, self.measurement_matrix.T), np.linalg.inv(innovation_cov))
         self.state_estimate = self.state_estimate + np.dot(kalman_gain, innovation)
-        self.covariance_estimate = np.dot(np.eye(4) - np.dot(kalman_gain, self.measurement_matrix), self.covariance_estimate)
+        self.covariance_estimate = np.dot(np.eye(6) - np.dot(kalman_gain, self.measurement_matrix), self.covariance_estimate)
+
 
     # 返回航迹对象的字符串表示
     def __str__(self):
@@ -159,3 +227,30 @@ class Track:
                 f"Predicted Track Point: {self.predicted_track_point}\n"
                 f"Unupdates: {self.unupdates}\n"
                 f"Max Unupdates: {self.max_unupdates}")
+    
+def cartesian_to_polar(x,y,z):
+    # 计算斜距
+    slant_range = math.sqrt(x**2 + y**2 + z**2)
+
+    # 计算方位角
+    azimuth_angle = math.atan2(y, x)
+    azimuth_angle_deg = math.degrees(azimuth_angle)
+
+    # 计算俯仰角
+    elevation_angle = math.asin(z / slant_range)
+    elevation_angle_deg = math.degrees(elevation_angle)
+
+    return slant_range, azimuth_angle_deg, elevation_angle_deg
+
+def calculate_radial_velocity(x,y,z,vx,vy,vz,slant_range):
+    # 计算径向速度
+    # 径向速度是速度向量在从观察点到目标点连线上的投影
+    radial_velocity = -((x * vx + y * vy + z * vz) / slant_range)
+    return radial_velocity
+
+def get_full_polar_coordinates(state):
+    x,y,z,vx,vy,vz = state
+    slant_range, azimuth_angle_deg, elevation_angle_deg = cartesian_to_polar(x,y,z)
+    radial_velocity = calculate_radial_velocity(x,y,z,vx,vy,vz,slant_range)
+    
+    return slant_range, azimuth_angle_deg, elevation_angle_deg, radial_velocity
